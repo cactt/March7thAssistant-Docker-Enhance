@@ -117,6 +117,9 @@ class CloudGameController(GameControllerBase):
             return os.path.join(browser_install_path, "chromedriver", platform_dir, browser_version, "chromedriver")  # 未验证
     MAX_RETRIES = 3  # 网页加载重试次数，0=不重试
     PERFERENCES = {
+        "intl": {
+            "accept_languages": "zh-CN,zh"  # Accept-Language 偏好，确保云游戏网页显示中文
+        },
         "profile": {
             "content_settings": {
                 "exceptions": {
@@ -318,7 +321,8 @@ class CloudGameController(GameControllerBase):
         args = [
             self.BROWSER_TAG,   # 标记浏览器是由脚本启动
             "--disable-infobars",   # 去掉提示 "Chrome测试版仅适用于自动测试。" 和 "浏览器正由自动测试软件控制。"
-            "--lang=zh-CN",     # 浏览器语言中文
+            "--lang=zh-CN",     # 浏览器 UI 语言中文
+            "--accept-lang=zh-CN,zh",  # 强制 Accept-Language 请求头为中文，确保云游戏网页显示中文（--lang 不影响 Accept-Language）
             "--log-level=3",    # 浏览器日志等级为error
             f"--force-device-scale-factor={float(self.cfg.browser_scale_factor)}",  # 设置缩放
             f"--app={self.GAME_URL}",   # 以应用模式启动
@@ -366,10 +370,24 @@ class CloudGameController(GameControllerBase):
         if not os.path.exists(self.user_profile_path):
             return
 
+        # 0. 关闭可能残留的 Chrome 进程，避免新旧进程同时操作同一 profile
+        # 残留进程会持有 Singleton 锁并继续写入配置文件，导致本次启动读取到半写入状态
+        # （上一个任务 stop_game 后进程可能尚未完全退出，调试端口也未释放）
+        try:
+            remaining = self.get_m7a_browsers()
+            if remaining:
+                self.log_debug(f"检测到 {len(remaining)} 个残留浏览器进程，正在关闭...")
+                self.close_all_m7a_browser()
+                # 等待文件系统刷新，让残留进程释放的句柄和未刷盘的数据落盘
+                time.sleep(1.0)
+        except Exception as e:
+            self.log_debug(f"关闭残留浏览器进程失败（可忽略）: {e}")
+
         # 1. 校验关键 JSON 配置文件
         config_files = [
             os.path.join(self.user_profile_path, "Local State"),
             os.path.join(self.user_profile_path, "Default", "Preferences"),
+            os.path.join(self.user_profile_path, "Default", "Secure Preferences"),  # Chrome 对此文件有完整性校验
         ]
         for filepath in config_files:
             if not os.path.exists(filepath):

@@ -112,7 +112,50 @@ const Dashboard = {
         </div>
         
         <!-- Right Column (Logs) -->
-        <div class="lg:col-span-2">
+        <div class="lg:col-span-2 space-y-6">
+          <!-- Live Screenshot Card -->
+          <div class="card-glass flex flex-col overflow-hidden">
+            <div class="flex justify-between items-center px-6 py-4 header-glass">
+              <h3 class="text-lg font-semibold text-slate-700 dark:text-slate-200 m-0 flex items-center">
+                <el-icon class="mr-2 text-violet-500 dark:text-violet-400"><Monitor /></el-icon>
+                实时画面
+                <span v-if="liveStatus.running" class="ml-3 px-2 py-1 bg-slate-100 dark:bg-slate-800 rounded text-xs text-slate-500 dark:text-slate-400 font-mono border border-slate-200 dark:border-slate-700">{{ liveStatus.account_name }}</span>
+              </h3>
+              <div class="flex items-center gap-2">
+                <div v-if="liveStatus.running" class="flex items-center gap-1.5 text-xs text-emerald-500">
+                  <span class="relative flex h-2 w-2">
+                    <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                  </span>
+                  LIVE
+                </div>
+                <button @click="toggleLiveView" class="p-2 text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-white bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 rounded-lg transition-all" :title="liveViewEnabled ? '暂停刷新' : '开启刷新'">
+                  <el-icon :class="{'is-loading': liveViewEnabled && liveStatus.running}"><Refresh /></el-icon>
+                </button>
+              </div>
+            </div>
+
+            <div class="relative bg-[#020617] flex items-center justify-center" style="min-height: 360px;">
+              <!-- 无运行账号 -->
+              <div v-if="!liveStatus.running" class="absolute inset-0 flex flex-col items-center justify-center text-slate-600 gap-2">
+                <el-icon class="text-4xl opacity-50"><VideoPause /></el-icon>
+                <span class="text-sm">{{ liveStatusChecked ? '当前无账号运行中' : '正在检查运行状态...' }}</span>
+              </div>
+              <!-- 运行中但 Chrome 未就绪 -->
+              <div v-else-if="!liveStatus.has_chrome" class="absolute inset-0 flex flex-col items-center justify-center text-slate-500 gap-2">
+                <el-icon class="text-3xl opacity-50 is-loading"><Loading /></el-icon>
+                <span class="text-sm">等待浏览器启动...</span>
+              </div>
+              <!-- 画面 -->
+              <img v-else-if="liveSnapshotSrc" :src="liveSnapshotSrc" class="w-full h-auto max-h-[480px] object-contain" alt="live screenshot" />
+              <!-- 截图加载中/失败 -->
+              <div v-else class="absolute inset-0 flex flex-col items-center justify-center text-slate-500 gap-2">
+                <el-icon class="text-3xl opacity-50 is-loading"><Loading /></el-icon>
+                <span class="text-sm">{{ liveErrorMsg || '正在获取画面...' }}</span>
+              </div>
+            </div>
+          </div>
+
           <div class="card-glass h-[680px] flex flex-col overflow-hidden">
             <div class="flex justify-between items-center px-6 py-4 header-glass">
               <h3 class="text-lg font-semibold text-slate-700 dark:text-slate-200 m-0 flex items-center">
@@ -129,7 +172,7 @@ const Dashboard = {
                 </button>
               </div>
             </div>
-            
+
             <div class="flex-1 bg-[#020617] p-4 overflow-y-auto font-mono text-[13px] leading-relaxed text-slate-300 custom-scrollbar" ref="logConsole" @scroll="handleScroll">
               <div v-if="!currentLogFile" class="h-full flex items-center justify-center text-slate-600">
                 请在左侧选择一次运行历史以查看日志...
@@ -152,7 +195,16 @@ const Dashboard = {
       currentLog: '',
       logLoading: false,
       pollInterval: null,
-      isAutoScroll: true
+      isAutoScroll: true,
+      // 实时画面相关
+      liveStatus: { running: false, has_chrome: false, account_name: null },
+      liveStatusChecked: false,
+      liveViewEnabled: true,        // 用户开关：是否自动刷新画面
+      liveSnapshotSrc: null,        // 当前画面 img src（带时间戳防缓存）
+      liveErrorMsg: null,
+      liveStatusInterval: null,     // 状态轮询定时器（5s）
+      liveSnapshotInterval: null,   // 画面轮询定时器（2s）
+      liveSnapshotLoading: false
     }
   },
   computed: {
@@ -185,9 +237,14 @@ const Dashboard = {
   mounted() {
     this.fetchData();
     this.pollInterval = setInterval(this.fetchData, 5000);
+    // 实时画面：状态轮询 5s，画面轮询 2s
+    this.pollLiveStatus();
+    this.liveStatusInterval = setInterval(this.pollLiveStatus, 5000);
   },
   unmounted() {
     clearInterval(this.pollInterval);
+    clearInterval(this.liveStatusInterval);
+    this.stopLiveSnapshotPolling();
   },
   methods: {
     async fetchData() {
@@ -312,6 +369,83 @@ const Dashboard = {
     formatRetryTime(value) {
       if (!value) return '';
       return `预计重试：${new Date(value).toLocaleString()}`;
+    },
+    // ===== 实时画面相关 =====
+    async pollLiveStatus() {
+      try {
+        const res = await api.get('/live/status');
+        const prevRunning = this.liveStatus.running;
+        const prevChrome = this.liveStatus.has_chrome;
+        this.liveStatus = res;
+        this.liveStatusChecked = true;
+
+        // 状态变化时启动/停止画面轮询
+        const shouldPoll = this.liveViewEnabled && this.liveStatus.running && this.liveStatus.has_chrome;
+        if (shouldPoll && !this.liveSnapshotInterval) {
+          // 立即拉一帧，再启动定时器
+          this.refreshLiveSnapshot();
+          this.liveSnapshotInterval = setInterval(this.refreshLiveSnapshot, 2000);
+        } else if (!shouldPoll && this.liveSnapshotInterval) {
+          this.stopLiveSnapshotPolling();
+          // 运行结束/Chrome 关闭时清空画面
+          if (!this.liveStatus.running) {
+            this.liveSnapshotSrc = null;
+            this.liveErrorMsg = null;
+          }
+        } else if (shouldPoll && prevChrome === false) {
+          // Chrome 刚就绪，立即拉一帧
+          this.refreshLiveSnapshot();
+        }
+      } catch (err) {
+        // 静默失败，下次轮询重试
+        this.liveStatusChecked = true;
+      }
+    },
+    stopLiveSnapshotPolling() {
+      if (this.liveSnapshotInterval) {
+        clearInterval(this.liveSnapshotInterval);
+        this.liveSnapshotInterval = null;
+      }
+    },
+    toggleLiveView() {
+      this.liveViewEnabled = !this.liveViewEnabled;
+      if (!this.liveViewEnabled) {
+        this.stopLiveSnapshotPolling();
+      } else if (this.liveStatus.running && this.liveStatus.has_chrome) {
+        this.refreshLiveSnapshot();
+        this.liveSnapshotInterval = setInterval(this.refreshLiveSnapshot, 2000);
+      }
+    },
+    async refreshLiveSnapshot() {
+      if (this.liveSnapshotLoading) return;
+      this.liveSnapshotLoading = true;
+      // 用 axios 直接请求二进制，需要 responseType: 'blob'
+      try {
+        const token = localStorage.getItem('m7a_webui_token');
+        const resp = await axios.get('/api/live/snapshot', {
+          responseType: 'blob',
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 8000
+        });
+        if (this.liveSnapshotSrc) {
+          URL.revokeObjectURL(this.liveSnapshotSrc);
+        }
+        this.liveSnapshotSrc = URL.createObjectURL(resp.data);
+        this.liveErrorMsg = null;
+      } catch (err) {
+        // 404 = 无运行账号，503 = 截图失败（Chrome 启动中/页面未就绪），保留旧画面或显示错误
+        const status = err.response && err.response.status;
+        if (status === 404) {
+          this.liveSnapshotSrc = null;
+          this.liveErrorMsg = null;
+        } else if (status === 503) {
+          this.liveErrorMsg = '画面获取中，请稍候...';
+        } else {
+          this.liveErrorMsg = '画面加载失败：' + (err.message || '未知错误');
+        }
+      } finally {
+        this.liveSnapshotLoading = false;
+      }
     }
   }
 };

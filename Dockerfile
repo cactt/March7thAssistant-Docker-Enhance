@@ -32,7 +32,7 @@ ENV MARCH7TH_CLOUD_GAME_ENABLE=true
 ENV MARCH7TH_BROWSER_HEADLESS_ENABLE=true
 ENV MARCH7TH_BROWSER_HEADLESS_RESTART_ON_NOT_LOGGED_IN=false
 # 默认使用官方源下载浏览器；如果下载缓慢，可以改为 true 启用镜像下载
-ENV MARCH7TH_BROWSER_DOWNLOAD_USE_MIRROR=false
+ENV MARCH7TH_BROWSER_DOWNLOAD_USE_MIRROR=true
 # 任务完成后循环执行
 ENV MARCH7TH_AFTER_FINISH=Loop
 # 标记从 Docker 启动，避免控制台阻塞
@@ -48,7 +48,7 @@ COPY webui/requirements.txt ./webui/requirements.txt
 # ======================
 RUN \
     # 如果需要使用国内源，可以取消下面一行的注释
-    # sed -i 's/deb.debian.org/mirrors.cloud.tencent.com/g' /etc/apt/sources.list.d/debian.sources && \
+    sed -i 's/deb.debian.org/mirrors.cloud.tencent.com/g' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -yq --no-install-recommends \
     # Lightweight init for proper zombie reaping (PID 1)
     tini \
@@ -90,9 +90,9 @@ RUN \
 # Python deps
 # ======================
 COPY --from=ghcr.io/astral-sh/uv:0.11.15 /uv /uvx /bin/
-RUN uv sync --only-group docker
-    # 如果需要使用国内源，可以取消下面一行的注释
-    # RUN uv sync --only-group docker --index-url https://mirrors.cloud.tencent.com/pypi/simple/
+# RUN uv sync --only-group docker
+# 如果需要使用国内源，可以取消下面一行的注释
+RUN uv sync --only-group docker --index-url https://mirrors.cloud.tencent.com/pypi/simple/
 RUN uv pip install -r webui/requirements.txt
 
 COPY build.py ./
@@ -114,6 +114,7 @@ RUN python build.py --task ocr \
 # ======================
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+# RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
 CMD ["python", "webui/main.py"]
