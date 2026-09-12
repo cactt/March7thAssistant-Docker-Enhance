@@ -116,5 +116,8 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 # RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
+#开放端口
+EXPOSE 8080
+
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
 CMD ["python", "webui/main.py"]
