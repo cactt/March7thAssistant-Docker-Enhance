@@ -2,6 +2,9 @@ import os
 import sys
 import io
 import json
+import re
+import asyncio
+import base64
 
 # Ensure the parent directory is in sys.path so 'webui' package can be imported
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -10,9 +13,10 @@ import time
 import subprocess
 import uvicorn
 import ruamel.yaml
+import requests
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
@@ -508,6 +512,135 @@ def get_qr_image(account_id: str):
     if os.path.exists(qr_path):
         return FileResponse(qr_path, media_type="image/png")
     raise HTTPException(status_code=404, detail="QR image not found")
+
+
+# --- Live screenshot via Chrome CDP ---
+
+# 标识由本助手启动的 Chrome 进程（与 module/game/cloud.py BROWSER_TAG 保持一致）
+_M7A_BROWSER_TAG = "--march-7th-assistant-sr-cloud-game"
+_M7A_BROWSER_NAMES = {
+    'chrome', 'chrome.exe', 'chromium', 'chromium-browser',
+    'msedge', 'msedge.exe', 'google-chrome', 'google-chrome-stable',
+}
+_CDP_PORT_PATTERN = re.compile(r"--remote-debugging-port=(\d+)")
+
+
+def _find_active_chrome_debug_port() -> Optional[int]:
+    """扫描进程列表，找到由本助手启动的 Chrome 进程，返回其 CDP 调试端口。
+
+    scheduler 同时只跑一个账号，所以全局只会找到一个端口。
+    """
+    import psutil
+    for proc in psutil.process_iter(['pid', 'name']):
+        name = proc.info.get('name') or ''
+        if name.lower() not in _M7A_BROWSER_NAMES:
+            continue
+        try:
+            cmdline = proc.cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        if _M7A_BROWSER_TAG not in cmdline:
+            continue
+        for arg in cmdline:
+            m = _CDP_PORT_PATTERN.search(arg)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+async def _capture_screenshot_via_cdp(port: int, timeout: float = 5.0) -> Optional[bytes]:
+    """通过 Chrome DevTools Protocol 截图，返回 JPEG 二进制数据。
+
+    流程：HTTP GET /json/list 获取 page tab → websocket 发 Page.captureScreenshot
+    """
+    import websockets
+
+    # 1. 获取 page 类型的 tab
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            f"http://127.0.0.1:{port}/json/list",
+            timeout=3
+        )
+        tabs = resp.json()
+    except Exception:
+        return None
+
+    page_tabs = [t for t in tabs if t.get('type') == 'page' and t.get('webSocketDebuggerUrl')]
+    if not page_tabs:
+        return None
+    ws_url = page_tabs[0]['webSocketDebuggerUrl']
+
+    # 2. 通过 websocket 调用 Page.captureScreenshot
+    try:
+        async with websockets.connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=1) as ws:
+            await ws.send(json.dumps({
+                "id": 1,
+                "method": "Page.captureScreenshot",
+                "params": {"format": "jpeg", "quality": 80}
+            }))
+            deadline = asyncio.get_event_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    return None
+                try:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+                except asyncio.TimeoutError:
+                    return None
+                if msg.get('id') == 1:
+                    data = msg.get('result', {}).get('data')
+                    if data:
+                        return base64.b64decode(data)
+                    return None
+    except Exception:
+        return None
+
+
+@app.get("/api/live/status")
+def live_status(user: UserInfo = Depends(get_current_user)):
+    """返回当前是否可查看实时画面。
+
+    仅当 scheduler 正在运行、且 account 用户绑定的是当前账号时才允许查看。
+    """
+    running = bool(scheduler.running and scheduler.current_account_id)
+    port = _find_active_chrome_debug_port() if running else None
+
+    # 账号用户只能查看自己账号的画面
+    if running and user.is_account_user and user.bound_account_id != scheduler.current_account_id:
+        running = False
+
+    return {
+        "running": running,
+        "account_id": scheduler.current_account_id if running else None,
+        "account_name": scheduler.current_account_name if running else None,
+        "has_chrome": port is not None,
+    }
+
+
+@app.get("/api/live/snapshot")
+async def live_snapshot(user: UserInfo = Depends(get_current_user)):
+    """返回当前账号的实时画面（JPEG）。前端用 <img> 轮询刷新。
+
+    失败时返回 404，前端会显示占位图。
+    """
+    # 必须有正在运行的账号
+    if not (scheduler.running and scheduler.current_account_id):
+        raise HTTPException(status_code=404, detail="No running account")
+
+    # 账号用户只能查看自己账号
+    if user.is_account_user and user.bound_account_id != scheduler.current_account_id:
+        raise HTTPException(status_code=403, detail="Cannot view other accounts")
+
+    port = _find_active_chrome_debug_port()
+    if not port:
+        raise HTTPException(status_code=404, detail="No active Chrome process")
+
+    img = await _capture_screenshot_via_cdp(port)
+    if not img:
+        raise HTTPException(status_code=503, detail="Screenshot failed, please retry")
+
+    return Response(content=img, media_type="image/jpeg")
 
 
 # --- Static files & Frontend ---

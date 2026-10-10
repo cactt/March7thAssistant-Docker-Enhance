@@ -6,7 +6,10 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
+config/
+log/
 
 # IDE
 .vscode/
@@ -27,7 +30,8 @@ dist/
 *.egg-info/
 
 # WebBrowser UserProfile (very large)
-3rdparty/WebBrowser/UserProfile/
+3rdparty/WebBrowser/
+settings/
 
 # Test and temporary files
 tests/
@@ -46,3 +50,4 @@ webui/pnpm-lock.yaml
 webui/vite.config.mjs
 webui/tailwind.config.js
 webui/postcss.config.js
+webui/data/
